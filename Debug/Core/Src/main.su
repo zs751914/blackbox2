@@ -9,10 +9,10 @@
 ../Core/Src/main.c:266:6:Determine_black_box	56	static
 ../Core/Src/main.c:313:7:Sample_PA1_Average	24	static
 ../Core/Src/main.c:330:6:Analyze_ADC_RC_TEST	104	static
-../Core/Src/main.c:418:6:Analyze_ADC_RL_TEST	64	static
-../Core/Src/main.c:480:5:evaluate_steady_state_fluctuation	24	static
-../Core/Src/main.c:498:5:evaluate_voltage_slope	80	static
-../Core/Src/main.c:561:7:Find_tau	72	static
-../Core/Src/main.c:628:5:main	24	static
-../Core/Src/main.c:707:6:SystemClock_Config	88	static
-../Core/Src/main.c:757:6:Error_Handler	4	static,ignoring_inline_asm
+../Core/Src/main.c:419:6:Analyze_ADC_RL_TEST	64	static
+../Core/Src/main.c:481:5:evaluate_steady_state_fluctuation	24	static
+../Core/Src/main.c:499:5:evaluate_voltage_slope	80	static
+../Core/Src/main.c:562:7:Find_tau	72	static
+../Core/Src/main.c:629:5:main	24	static
+../Core/Src/main.c:708:6:SystemClock_Config	88	static
+../Core/Src/main.c:758:6:Error_Handler	4	static,ignoring_inline_asm

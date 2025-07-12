@@ -367,7 +367,7 @@ void Analyze_ADC_RC_TEST(){
                     //break;
                 }
     }
-	if(v_initial_RCS+v_end>=VREF){
+	if(v_initial_RCS+VPA1>=VREF){
 		black_box.detected_type=RC_SERIES;
 
 	}else{
@@ -412,6 +412,7 @@ void Analyze_ADC_RC_TEST(){
 	    	 sprintf(message1, "Rp=%.2fΩ", r_black);
 	    	 sprintf(message2, "Cp=%.4fuF", c_black*1e6);
 	    	              }
+        }
 }
 
 //RL换用方案B
@@ -488,7 +489,7 @@ int evaluate_steady_state_fluctuation() {
     		break;
     	}
     }
-    if(voltage>=v_end){
+    if(index<BUFFER_SIZE-1){
     	return 1;
     }else{
     	return 0;
