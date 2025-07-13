@@ -59,6 +59,7 @@ typedef enum {
     RC_PARALLEL,
     RL_SERIES,
     RL_PARALLEL,
+	OR,
 	RC,
 	RL
 } CircuitType;
@@ -225,7 +226,7 @@ void DMA_Measure(void) {
         if(black_box.detected_type == UNKNOWN) {
             // STEP_PIN: 高电平
         	HAL_GPIO_WritePin(GPIOA, STEP_PIN, GPIO_PIN_SET);
-        }else if(black_box.detected_type == RC) {
+        }else if(black_box.detected_type == RC||black_box.detected_type==OR) {
             // STEP3_PIN: 高电平
         	HAL_GPIO_WritePin(GPIOA, STEP3_PIN, GPIO_PIN_SET);
         }
@@ -290,16 +291,16 @@ void Determine_black_box(void){
 
     float chazhi=fabsf(v_initial-v_steady);
     if(chazhi<0.1 && !evaluate_voltage_slope()){
-    	if(fabsf(v_initial-VREF)<0.2){
-    		black_box.detected_type=no_load;
-    		strcpy(message2, "no load");
-    		return;
+    	black_box.detected_type=OR;
+    	if(BigRtest()==1){
+    		strcpy(message2, "Pure Resistor");
+    	}else if(BigRtest()==0){
+    		black_box.detected_type=RC;
+    		Analyze_ADC_RC_TEST();
     	}else{
-//      float r_black=v_steady/(VREF-v_steady)*R_KNOWN;
-//    	sprintf(message1,"%.3f",r_black);
-    	strcpy(message2, "Pure Resistor");
-    	black_box.detected_type=RESISTOR;
+    		sprintf(msg, "no load");
     	}
+
     }else if(v_steady>v_initial){
     	black_box.detected_type=RC;
         Analyze_ADC_RC_TEST();
@@ -325,6 +326,39 @@ float Sample_PA1_Average(void) {
     }
     // 5. 返回平均值
     return sum / BUFFER2_SIZE;
+}
+//
+void BigRtest(void){
+	memset(adc_buffer, 0, sizeof(adc_buffer));
+	float v_initial;
+	float initial_index;
+	float v_end;
+	GPIO_Set_Low(GPIOA, GPIO_PIN_4);
+	GPIO_Set_Low(GPIOA, GPIO_PIN_7);
+	GPIO_Set_HighZ(GPIOA, GPIO_PIN_0);
+	DMA_Measure();
+    for (int i = 0; i < BUFFER_SIZE; i++) {
+                    float voltage = (adc_buffer[i] * VREF) / 4095.0f;
+                    if (voltage > 0.4) {
+                        initial_index = i;
+                        v_initial = voltage;
+                        break;
+                    }
+        }
+    v_end=(adc_buffer[BUFFER_SIZE-1]*VREF/4095.0f);
+    if(fabsf(VREF-v_initial)<=0.1){
+    	//sprintf(msg, "no load");
+    	return 2;
+    }
+    float chazhi=fabsf(v_end-v_initial);
+    if(chazhi<0.1){
+    	//black_box.detected_type=RESISTOR;
+    	return 1;
+    }else{
+    	//black_box.detected_type=RC;
+    	return 0;
+    }
+
 }
 //RC换用电阻5.1k
 void Analyze_ADC_RC_TEST(){
@@ -489,7 +523,7 @@ int evaluate_steady_state_fluctuation() {
     		break;
     	}
     }
-    if(index<BUFFER_SIZE-1){
+    if(v_end>=0.98*VPA1){
     	return 1;
     }else{
     	return 0;
@@ -514,16 +548,24 @@ int evaluate_voltage_slope() {
     int consistent_direction = 1; // 是否保持单调
     int first_direction = 0;     // 首个有效变化方向: 1=上升, -1=下降
     float prev_voltage = (adc_buffer[start_index] * VREF) / 4095.0f;
+    float start_voltage = prev_voltage;
+    int direction_changes = 0;   // 方向改变次数
+    int significant_changes = 0; // 显著变化次数
 
     for (int i = start_index + 1; i < start_index + 20; i++) {
         float current_voltage = (adc_buffer[i] * VREF) / 4095.0f;
         float delta = current_voltage - prev_voltage;
 
+        // 计算相对变化率（相对于VREF）
+        float relative_delta = fabsf(delta) / VREF;
+
         // 忽略微小变化（小于0.05% VREF）
-        if (fabsf(delta) < 0.0005f * VREF) {
+        if (relative_delta < 0.0005f) {
             prev_voltage = current_voltage;
             continue;
         }
+
+        significant_changes++;
 
         // 确定当前变化方向
         int current_direction = (delta > 0) ? 1 : -1;
@@ -534,12 +576,16 @@ int evaluate_voltage_slope() {
         }
         // 检测方向变化
         else if (current_direction != first_direction) {
+            direction_changes++;
             consistent_direction = 0; // 方向改变，非单调
-            break;
         }
 
         prev_voltage = current_voltage;
     }
+
+    float end_voltage = prev_voltage;
+    float total_change = fabsf(end_voltage - start_voltage);
+    float relative_total_change = total_change / VREF;
 
     // 计算平均变化率（绝对值）
     float total_slope = 0;
@@ -551,13 +597,21 @@ int evaluate_voltage_slope() {
         num_slopes++;
     }
     float avg_slope = (num_slopes > 0) ? total_slope / num_slopes : 0;
-    float slope_threshold = 0.0005f * VREF; // 斜率阈值
+    float relative_avg_slope = avg_slope / VREF; // 相对平均斜率
 
-    // 判断逻辑：
-    // 1. 若变化方向单调且平均斜率低于阈值 → 电感/电容
-    // 2. 若变化方向非单调或平均斜率过高 → 电阻
-    //return (consistent_direction && avg_slope < slope_threshold) ? 1 : 0;
-    return  consistent_direction ;
+    // 计算最终判断结果
+    // 1. 单调上升且整体有显著变化 → 电感/电容
+    // 2. 单调上升但变化平缓，不过持续时间长 → 电感/电容
+    // 3. 其他情况 → 电阻
+    if (consistent_direction && first_direction == 1) {
+        // 单调上升情况
+        if (relative_total_change > 0.01f || (relative_avg_slope < 0.0005f && significant_changes > 15)) {
+            return 1; // 电感/电容
+        }
+    }
+
+    // 其他情况判断
+    return (consistent_direction && relative_avg_slope < 0.0005f) ? 1 : 0;
 }
 float Find_tau(){
     float start_index;
@@ -613,7 +667,7 @@ float Find_tau(){
 //    	}
 //    }
 //    float tau=(mid_index-start_index) * (1.0f / SAMPLE_RATE);
-    if(index1-start_index>10){
+    if(index2-index1>10){
     	return tau;
     }else{
     	return 0;
