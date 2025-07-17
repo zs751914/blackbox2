@@ -44,6 +44,7 @@
 #define R_KNOWN2        5100      //5.1K
 #define VREF             3.3f        // 参考电压
 #define SAMPLE_RATE      500000      // 500kHz采样率
+#define BIGBUFFER_SIZE   5000
 #define BUFFER_SIZE      2048        // DMA缓冲区大小
 #define BUFFER2_SIZE     20
 #define MIN_VOLTAGE      0.05f       // 有效电压阈值
@@ -144,6 +145,7 @@ uint16_t adc_buffer1_com[BUFFER_SIZE];
 uint16_t adc_buffer2_com[BUFFER_SIZE];
 uint16_t adc_buffer3_com[BUFFER_SIZE];
 uint16_t adc_buffer4_com[BUFFER_SIZE];
+uint16_t bigadc_buffer[BIGBUFFER_SIZE];
 volatile uint32_t step_time_index = 0;  // 阶跃时间点索引
 volatile uint8_t measurement_done = 0;  // 测量完成标志
 volatile uint32_t step_timeout_index = 0;  // 阶跃时间点结束索引
@@ -174,8 +176,8 @@ int steady_test(uint16_t *adc_buffer, float V);     //是否到稳态
 float Find_tau_com(uint16_t *adc_buffer);
 int Analyze_trend(uint16_t *adc_buffer, float V);
 float calculate_average(uint16_t *buffer);
-float Sample_PA0_Average(void) ;
-float Sample_PA7_Average(void) ;
+float Sample_PA0_Average(void);
+float Sample_PA7_Average(void);
 int status;
 //引脚设置
 void GPIO_Set_Low(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin);
@@ -237,15 +239,15 @@ void component_test() {
 	//memset(adc_buffer1_com, 0, sizeof(adc_buffer1_com));
 	DMA_Measure_com(1, adc_buffer1_com);
 	VPA1Z = VPA1;
-	VPA0Z =VPA0;
-	VPA7Z=VPA7;
+	VPA0Z = VPA0;
+	VPA7Z = VPA7;
 	GPIO_Set_HighZ(GPIOA, GPIO_PIN_4);
 	GPIO_Set_HighZ(GPIOB, GPIO_PIN_15);
 	//memset(adc_buffer2_com, 0, sizeof(adc_buffer2_com));
 	DMA_Measure_com(2, adc_buffer2_com);
 	VPA1F = VPA1;
-	VPA0F=VPA0;
-	VPA7F=VPA7;
+	VPA0F = VPA0;
+	VPA7F = VPA7;
 	if (adc_buffer1_com[20] >= 0.98 * VREF && adc_buffer2_com[20] <= 0.01f) {
 		sprintf(msg, "no load");
 	} else {
@@ -363,9 +365,9 @@ void Determine_component() {
 						}
 					}
 					//float r_com = (v_initial * 5100) / (VREF - v_initial);
-					float c_com = tau / (r_com+5100);
+					float c_com = tau / (r_com + 5100);
 					sprintf(message1, "Rs=%.2fΩ", r_com);
-					sprintf(message2, "Cs=%.4fuF", c_com*1e6);
+					sprintf(message2, "Cs=%.4fuF", c_com * 1e6);
 				} else {   //换电阻后未达稳态
 					float v_target1 = (adc_buffer1_com[800] * VREF) / 4095.0f;
 					float v_initial = 0.0f;
@@ -395,29 +397,91 @@ void Determine_component() {
 			}
 
 		} else {
-			float v_target1 = (adc_buffer1_com[200] * VREF) / 4095.0f;
-			float v_initial = 0.0f;
-			//int initial_index;
+			float v_initial;
+			float index;
+			int find = 0;
+			float initial_index;
 			for (int i = 0; i < BUFFER_SIZE; i++) {
 				float voltage = (adc_buffer1_com[i] * VREF) / 4095.0f;
 				if (voltage > MIN_VOLTAGE) {
 					v_initial = voltage;
-					//initial_index=i;
+					initial_index = i;
 					break;
 				}
 			}
-			int target1_index = 200;
-			float v_target2 = (adc_buffer1_com[2000] * VREF) / 4095.0f;
-			;
-			int target2_index = 2000;
-			float delta_t = (target2_index - target1_index)
-					/ (float) SAMPLE_RATE;
-			// 计算时间常数τ = Δt / ln[(V_ss - v1)/(V_ss - v2)]
-			float tau = delta_t/ log((VPA1Z - v_target1) / (VPA1Z - v_target2));
-			float r_com = (v_initial * R_KNOWN) / (VREF - v_initial);
-			float c_com = tau / (r_com + R_KNOWN);
-			sprintf(message1, "Rs=%.2fΩ", r_com);
-			sprintf(message2, "Cs=%.4fuF", c_com*1e6);
+			//float r_com = (v_initial * R_KNOWN) / (VREF - v_initial);
+			float v_target = 0.632 * VPA1Z;
+			for (int i = 0; i < BUFFER_SIZE; i++) {
+				float voltage = (adc_buffer1_com[i] * VREF) / 4095.0f;
+				if (voltage >= v_target) {
+					index = i;
+					if (index < BUFFER_SIZE - 1) {
+						find = 1;
+						break;
+					} else {
+						find = 0;
+					}
+				}
+			}
+			if (find == 1) {
+				float tau = (index - initial_index) * 2 / 1000000;
+				float r_com = (v_initial * R_KNOWN) / (VREF - v_initial);
+				float c_com = tau / (r_com + R_KNOWN);
+				sprintf(message1, "Rs=%.2fΩ", r_com);
+				sprintf(message2, "Cs=%.4fuF", c_com * 1e6);
+			} else {
+				HAL_Delay(50);  // 10ms放电
+				// 2. 启动DMA采样
+				GPIO_Set_Low(GPIOA, GPIO_PIN_0);
+				GPIO_Set_HighZ(GPIOA, GPIO_PIN_4);
+				GPIO_Set_Low(GPIOA, GPIO_PIN_7);
+				GPIO_Set_HighZ(GPIOB, GPIO_PIN_15);
+				uint32_t start_tick = HAL_GetTick();
+				HAL_ADC_Start_DMA(&hadc1, (uint32_t*) bigadc_buffer,
+						BIGBUFFER_SIZE);
+				measurement_done = 0;
+				HAL_GPIO_WritePin(GPIOA, STEP_PIN, GPIO_PIN_SET);
+				// 3. 短暂延时确保DMA已启动
+				//HAL_Delay(1);
+				while (!measurement_done)
+					;
+				HAL_ADC_Stop_DMA(&hadc1);
+				uint32_t end_tick = HAL_GetTick();
+				HAL_Delay(50);
+				VPA1 = Sample_PA1_Average();
+				VPA0 = Sample_PA0_Average();
+				VPA7 = Sample_PA7_Average();
+				GPIO_Set_Low(GPIOA, GPIO_PIN_0);
+				GPIO_Set_Low(GPIOA, GPIO_PIN_4);
+				GPIO_Set_Low(GPIOA, GPIO_PIN_7);
+				GPIO_Set_Low(GPIOB, GPIO_PIN_15);
+				float v_initial;
+				float index;
+				int find = 0;
+				float initial_index;
+				for (int i = 0; i < BIGBUFFER_SIZE; i++) {
+					float voltage = (bigadc_buffer[i] * VREF) / 4095.0f;
+					if (voltage > MIN_VOLTAGE) {
+						v_initial = voltage;
+						initial_index = i;
+						break;
+					}
+				}
+				//float r_com = (v_initial * R_KNOWN) / (VREF - v_initial);
+				float v_target = 0.632 * VPA1;
+				for (int i = 0; i < BIGBUFFER_SIZE; i++) {
+					float voltage = (bigadc_buffer[i] * VREF) / 4095.0f;
+					if (voltage >= v_target) {
+						index = i;
+						break;
+					}
+				}
+				float tau = (index - initial_index) * 2 / 1000000;
+				float r_com = (v_initial * R_KNOWN) / (VREF - v_initial);
+				float c_com = tau / (r_com + R_KNOWN);
+				sprintf(message1, "Rs=%.2fΩ", r_com);
+				sprintf(message2, "Cs=%.4fuF", c_com * 1e6);
+			}
 
 		}
 		//计算RC
@@ -433,10 +497,12 @@ void Determine_component() {
 			component.params.diode.forward_voltage = fabs(a);
 			if (a > 0) {
 				component.params.diode.polarity == L_TO_R;   //>>
-				sprintf(message1, " Z V=%.2fΩ", component.params.diode.forward_voltage);
+				sprintf(message1, " Z V=%.2fΩ",
+						component.params.diode.forward_voltage);
 			} else {
 				component.params.diode.polarity == R_TO_L;   //<<
-				sprintf(message1, " F V=%.2fΩ", component.params.diode.forward_voltage);
+				sprintf(message1, " F V=%.2fΩ",
+						component.params.diode.forward_voltage);
 			}
 			//计算D
 		} else {
@@ -447,12 +513,23 @@ void Determine_component() {
 			GPIO_Set_Low(GPIOB, GPIO_PIN_15);
 			memset(adc_buffer3_com, 0, sizeof(adc_buffer3_com));
 			DMA_Measure_com(4, adc_buffer3_com);
-			//VPA1Z=VPA1;
+			VPA1Z = VPA1;
+			//VPA0Z=VPA0;
+			//VPA7Z=VPA7;
 			GPIO_Set_HighZ(GPIOA, GPIO_PIN_0);
 			GPIO_Set_HighZ(GPIOA, GPIO_PIN_4);
 			memset(adc_buffer4_com, 0, sizeof(adc_buffer4_com));
 			DMA_Measure_com(2, adc_buffer4_com);
 			VPA1F = VPA1;
+			//VPA0F=VPA0;
+			//VPA7F=VPA7;
+			float v_initial;
+			//float index;
+			//int find = 0;
+
+							//float c_com = tau / r_com;
+			int initial_index;
+			int index=0;
 			if (Analyze_trend(adc_buffer3_com, VPA1Z) == 1
 					&& Analyze_trend(adc_buffer4_com, VPA1F) == -1) {
 				component.type = COMPONENT_C;   //计算小c
@@ -463,30 +540,37 @@ void Determine_component() {
 					float voltage = (adc_buffer3_com[i] * VREF) / 4095.0f;
 					if (voltage > MIN_VOLTAGE) {
 						v_initial = voltage;
-						//initial_index=i;
+						initial_index=i;
 						break;
 					}
 				}
 				float r_com = (v_initial * R_KNOWN) / (VREF - v_initial);
 				//float c_com = tau / r_com;
 				sprintf(message1, "Rs=%.2fΩ", r_com);
-
-				float tau = Find_tau_com(adc_buffer3_com);
+				float v_target = 0.632 * VPA1Z;
+				for (int i = 0; i < BUFFER_SIZE; i++) {
+					float voltage = (adc_buffer3_com[i] * VREF) / 4095.0f;
+					if (voltage >= v_target) {
+						 index = i;
+						break;
+					}
+				}
+				float tau = (index - initial_index) * 2 / 1000000;
+				//float tau = Find_tau_com(adc_buffer3_com);
 				float c_com = tau / r_com;
 				sprintf(message2, "Cs=%.2fΩ", c_com * 1e6);
-			} else
-			if (analyze_Vpicture(adc_buffer3_com, adc_buffer4_com)
+			} else if (analyze_Vpicture(adc_buffer3_com, adc_buffer4_com)
 					== 1) {
 				//
 				component.type = COMPONENT_R;   //
-				float V=calculate_average(adc_buffer3_com);
+				float V = calculate_average(adc_buffer3_com);
 				float R;
-				R=470000/(VPA0Z-V) * V;
+				R = 470000 / (VPA0Z - V) * V;
 				sprintf(message1, " R=%.2fΩ", R);
-                //return 1;
+				//return 1;
 				//计算大电阻
 			} else if (analyze_Vpicture(adc_buffer1_com, adc_buffer2_com)
-					== 1) {
+					== 2) {
 				component.type = COMPONENT_R;
 				//
 				//换5.1k电阻计算
@@ -497,7 +581,7 @@ void Determine_component() {
 				DMA_Measure_com(3, adc_buffer3_com);
 				float V = calculate_average(adc_buffer3_com);
 				float R;
-				R = 5100 / (VPA0Z-V) * V;
+				R = 5100 / (VPA0Z - V) * V;
 				sprintf(message1, " R=%.2fΩ", R);
 			} else {
 				//小电阻电感
@@ -523,7 +607,6 @@ float Find_tau_com(uint16_t *adc_buffer) {
 
 	// 2. 更准确地检测稳态点和稳态电压
 	float v_steady = (adc_buffer[BUFFER_SIZE - 1] * VREF) / 4095.0f;
-
 
 	// 3. 寻找目标电压点（使用改进的算法）
 	float v_target1 = v_steady * 0.632;  // 1个时间常数
@@ -568,97 +651,108 @@ int steady_test(uint16_t *adc_buffer, float V) {
 	}
 }
 int analyze_Vpicture(uint16_t *adc_buffer, uint16_t *adc_buffer2) {
-    float ave1=calculate_average(adc_buffer);
-    float ave2=calculate_average(adc_buffer2);
-    if(ave1>=0.3){
-    	return 1;
-    }else{
-    	return 0;
-    }
+	float v1 = calculate_average(adc_buffer);
+	float v2 = calculate_average(adc_buffer2);
+	float v_lowZ = 3.3 * 1 / 11;
+	float v_highZ = 3.3 * 10 / 11;
+	float v_lowF = 3.3 * 1 / 11;
+	float v_highF = 3.3 * 10 / 11;
+	if ((v_lowZ <= v1 && v1 <= v_highZ) && (v_lowF <= v2 && v2 <= v_highF)) {
+		return 1;  //符合
+	} else if (v1 > v_highZ && v2 < v_lowF) {
+		return 2;  //大
+	} else if (v1 < v_lowZ && v2 > v_highF) {
+		return 3;  //小
+	}
 }
 
 int Analyze_trend(uint16_t *adc_buffer, float V_steady) {
-    // 寻找起始有效电压点
-    int start_index = -1;
-    float start_voltage = 0.0f;
-    for (int i = 0; i < BUFFER_SIZE; i++) {
-        float voltage = (adc_buffer[i] * VREF) / 4095.0f;
-        if (voltage > MIN_VOLTAGE) {
-            start_index = i;
-            start_voltage = voltage;
-            break;
-        }
-    }
+	// 寻找起始有效电压点
+	int start_index = -1;
+	float start_voltage = 0.0f;
+	for (int i = 0; i < BUFFER_SIZE; i++) {
+		float voltage = (adc_buffer[i] * VREF) / 4095.0f;
+		if (voltage > MIN_VOLTAGE) {
+			start_index = i;
+			start_voltage = voltage;
+			break;
+		}
+	}
 
-    if (start_index == -1) return 0; // 无有效数据
+	if (start_index == -1)
+		return 0; // 无有效数据
 
-    // 计算结束电压（取最后10%数据的平均值）
-    float end_voltage = 0.0f;
-    int count = 0;
-    for (int i = BUFFER_SIZE * 0.9; i < BUFFER_SIZE; i++) {
-        if (i >= start_index) {
-            end_voltage += (adc_buffer[i] * VREF) / 4095.0f;
-            count++;
-        }
-    }
+	// 计算结束电压（取最后10%数据的平均值）
+	float end_voltage = 0.0f;
+	int count = 0;
+	for (int i = BUFFER_SIZE * 0.9; i < BUFFER_SIZE; i++) {
+		if (i >= start_index) {
+			end_voltage += (adc_buffer[i] * VREF) / 4095.0f;
+			count++;
+		}
+	}
 
-    if (count == 0) return 0;
-    end_voltage /= count;
+	if (count == 0)
+		return 0;
+	end_voltage /= count;
 
-    // 计算电压变化量
-    float delta_voltage = end_voltage - start_voltage;
+	// 计算电压变化量
+	float delta_voltage = end_voltage - start_voltage;
 
-    // 判断基本趋势
-    if (fabsf(delta_voltage) < 0.1) return 0; // 无明显趋势
+	// 判断基本趋势
+	if (fabsf(delta_voltage) < 0.1)
+		return 0; // 无明显趋势
 
-    // 计算前20%数据的平均上升速率（用于区分电阻和电容）
-    float fast_rising_threshold = 0.03f; // 快速上升阈值（V/采样点）
-    float avg_initial_slope = 0.0f;
-    int initial_points = BUFFER_SIZE * 0.2;
-    int valid_initial_points = 0;
+	// 计算前20%数据的平均上升速率（用于区分电阻和电容）
+	float fast_rising_threshold = 0.03f; // 快速上升阈值（V/采样点）
+	float avg_initial_slope = 0.0f;
+	int initial_points = BUFFER_SIZE * 0.2;
+	int valid_initial_points = 0;
 
-    for (int i = start_index; i < start_index + initial_points && i < BUFFER_SIZE - 1; i++) {
-        float slope = ((adc_buffer[i+1] - adc_buffer[i]) * VREF) / 4095.0f;
-        avg_initial_slope += slope;
-        valid_initial_points++;
-    }
+	for (int i = start_index;
+			i < start_index + initial_points && i < BUFFER_SIZE - 1; i++) {
+		float slope = ((adc_buffer[i + 1] - adc_buffer[i]) * VREF) / 4095.0f;
+		avg_initial_slope += slope;
+		valid_initial_points++;
+	}
 
-    if (valid_initial_points > 0) {
-        avg_initial_slope /= valid_initial_points;
-    }
+	if (valid_initial_points > 0) {
+		avg_initial_slope /= valid_initial_points;
+	}
 
-    // 计算曲线非线性度（电容充电为指数曲线，电阻为线性）
-    float nonlinearity = 0.0f;
-    int curve_points = BUFFER_SIZE * 0.5;
-    int valid_curve_points = 0;
+	// 计算曲线非线性度（电容充电为指数曲线，电阻为线性）
+	float nonlinearity = 0.0f;
+	int curve_points = BUFFER_SIZE * 0.5;
+	int valid_curve_points = 0;
 
-    for (int i = start_index; i < start_index + curve_points && i < BUFFER_SIZE - 2; i++) {
-        float v1 = (adc_buffer[i] * VREF) / 4095.0f;
-        float v2 = (adc_buffer[i+1] * VREF) / 4095.0f;
-        float v3 = (adc_buffer[i+2] * VREF) / 4095.0f;
+	for (int i = start_index;
+			i < start_index + curve_points && i < BUFFER_SIZE - 2; i++) {
+		float v1 = (adc_buffer[i] * VREF) / 4095.0f;
+		float v2 = (adc_buffer[i + 1] * VREF) / 4095.0f;
+		float v3 = (adc_buffer[i + 2] * VREF) / 4095.0f;
 
-        // 线性度指标：(v3-v2)与(v2-v1)的差异
-        float linear_diff = fabsf((v3 - v2) - (v2 - v1));
-        nonlinearity += linear_diff;
-        valid_curve_points++;
-    }
+		// 线性度指标：(v3-v2)与(v2-v1)的差异
+		float linear_diff = fabsf((v3 - v2) - (v2 - v1));
+		nonlinearity += linear_diff;
+		valid_curve_points++;
+	}
 
-    if (valid_curve_points > 0) {
-        nonlinearity /= valid_curve_points;
-    }
+	if (valid_curve_points > 0) {
+		nonlinearity /= valid_curve_points;
+	}
 
-    // 关键判断逻辑：
-    // 1. 若初始上升速率快且非线性度低，认为是电阻（返回0）
-    // 2. 若初始上升速率慢且非线性度高，认为是电容（返回1）
-    if (delta_voltage > 0) {
-        if (avg_initial_slope > fast_rising_threshold && nonlinearity < 0.005) {
-            return 0; // 大电阻特性（快速上升且接近线性）
-        } else {
-            return 1; // 电容特性（缓慢上升且非线性）
-        }
-    } else {
-        return -1; // 下降趋势
-    }
+	// 关键判断逻辑：
+	// 1. 若初始上升速率快且非线性度低，认为是电阻（返回0）
+	// 2. 若初始上升速率慢且非线性度高，认为是电容（返回1）
+	if (delta_voltage > 0) {
+		if (avg_initial_slope > fast_rising_threshold && nonlinearity < 0.005) {
+			return 0; // 大电阻特性（快速上升且接近线性）
+		} else {
+			return 1; // 电容特性（缓慢上升且非线性）
+		}
+	} else {
+		return -1; // 下降趋势
+	}
 }
 
 //
@@ -679,23 +773,23 @@ float Danalyze() {
 	}
 
 	float v1 = calculate_average(adc_buffer1_com);
-	float IZ=fabs(VPA0Z-v1)/51;
+	float IZ = fabs(VPA0Z - v1) / 51;
 	float v2 = calculate_average(adc_buffer2_com);
-	float IF=fabs(v2-VPA0F)/51;
-    float a=IZ/IF;
-    float b=IF/IZ;
-    float delta = fabs(v1 - v2);
-    if(a>5||b>=5){
-    	if(a>5){
-    		//sprintf(message1, " Z V=%.2fΩ", delta);
-    		return delta;
-    	}else{
-    		//sprintf(message1, " F V=%.2fΩ", delta);
-    		return -delta;
-    	}
-    }else{
-    	return 0;
-    }
+	float IF = fabs(v2 - VPA0F) / 51;
+	float a = IZ / IF;
+	float b = IF / IZ;
+	float delta = fabs(v1 - v2);
+	if (a > 5 || b >= 5) {
+		if (a > 5) {
+			//sprintf(message1, " Z V=%.2fΩ", delta);
+			return delta;
+		} else {
+			//sprintf(message1, " F V=%.2fΩ", delta);
+			return -delta;
+		}
+	} else {
+		return 0;
+	}
 }
 //
 float calculate_average(uint16_t *buffer) {
@@ -792,76 +886,81 @@ void DMA_Measure(void) {
 }
 //
 // 简化的通道切换函数
-int ADC_SampleWithTemporaryChannel(ADC_HandleTypeDef* hadc, uint32_t temp_channel,
-                                  uint16_t* buffer, int size) {
-    HAL_StatusTypeDef status;
+int ADC_SampleWithTemporaryChannel(ADC_HandleTypeDef *hadc,
+		uint32_t temp_channel, uint16_t *buffer, int size) {
+	HAL_StatusTypeDef status;
 
-    // 1. 停止当前ADC DMA
-    status = HAL_ADC_Stop_DMA(hadc);
-    if (status != HAL_OK) return -1;
+	// 1. 停止当前ADC DMA
+	status = HAL_ADC_Stop_DMA(hadc);
+	if (status != HAL_OK)
+		return -1;
 
-    // 2. 配置为临时通道
-    ADC_ChannelConfTypeDef sConfig = {0};
-    sConfig.Channel = temp_channel;
-    sConfig.Rank = 1;
-    sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES; // 根据您的需求设置
+	// 2. 配置为临时通道
+	ADC_ChannelConfTypeDef sConfig = { 0 };
+	sConfig.Channel = temp_channel;
+	sConfig.Rank = 1;
+	sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES; // 根据您的需求设置
 
-    status = HAL_ADC_ConfigChannel(hadc, &sConfig);
-    if (status != HAL_OK) return -2;
+	status = HAL_ADC_ConfigChannel(hadc, &sConfig);
+	if (status != HAL_OK)
+		return -2;
 
-    // 3. 启动临时通道采样
-    measurement_done = 0; // 重置完成标志
-    status = HAL_ADC_Start_DMA(hadc, (uint32_t*)buffer, size);
-    if (status != HAL_OK) return -3;
+	// 3. 启动临时通道采样
+	measurement_done = 0; // 重置完成标志
+	status = HAL_ADC_Start_DMA(hadc, (uint32_t*) buffer, size);
+	if (status != HAL_OK)
+		return -3;
 
-    // 4. 等待采样完成
-    while (!measurement_done); // 由DMA中断回调设置
+	// 4. 等待采样完成
+	while (!measurement_done)
+		; // 由DMA中断回调设置
 
-    // 5. 停止DMA
-    status = HAL_ADC_Stop_DMA(hadc);
-    if (status != HAL_OK) return -4;
+	// 5. 停止DMA
+	status = HAL_ADC_Stop_DMA(hadc);
+	if (status != HAL_OK)
+		return -4;
 
-    // 6. 恢复为默认通道1
-    sConfig.Channel = ADC_CHANNEL_1;
-    status = HAL_ADC_ConfigChannel(hadc, &sConfig);
-    if (status != HAL_OK) return -5;
+	// 6. 恢复为默认通道1
+	sConfig.Channel = ADC_CHANNEL_1;
+	status = HAL_ADC_ConfigChannel(hadc, &sConfig);
+	if (status != HAL_OK)
+		return -5;
 
-
-    return 0;
+	return 0;
 }
 //
 // 简化的采样函数
 float Sample_PA7_Average(void) {
-    memset(adc_buffer2, 0, sizeof(adc_buffer2));
+	memset(adc_buffer2, 0, sizeof(adc_buffer2));
 
-    int result = ADC_SampleWithTemporaryChannel(&hadc1, ADC_CHANNEL_5,
-                                              adc_buffer2, BUFFER2_SIZE);
+	int result = ADC_SampleWithTemporaryChannel(&hadc1, ADC_CHANNEL_5,
+			adc_buffer2, BUFFER2_SIZE);
 
-    if (result == 0) {
-        float sum = 0.0f;
-        for (int i = 0; i < BUFFER2_SIZE; i++) {
-            float voltage = (adc_buffer2[i] * VREF) / 4095.0f;
-            sum += voltage;
-        }
-        return sum / BUFFER2_SIZE;
-    }
-    return -1.0f; // 错误返回值
+	if (result == 0) {
+		float sum = 0.0f;
+		for (int i = 0; i < BUFFER2_SIZE; i++) {
+			float voltage = (adc_buffer2[i] * VREF) / 4095.0f;
+			sum += voltage;
+		}
+		return sum / BUFFER2_SIZE;
+	}
+	return -1.0f; // 错误返回值
 }
 float Sample_PA0_Average(void) {
-    memset(adc_buffer2, 0, sizeof(adc_buffer2));
+	memset(adc_buffer2, 0, sizeof(adc_buffer2));
 
-    int result = ADC_SampleWithTemporaryChannel(&hadc1, ADC_CHANNEL_6,
-                                              adc_buffer2, BUFFER2_SIZE);
+	int result = ADC_SampleWithTemporaryChannel(&hadc1, ADC_CHANNEL_6,
+			adc_buffer2, BUFFER2_SIZE);
 
-    if (result == 0) {
-        float sum = 0.0f;
-        for (int i = 0; i < BUFFER2_SIZE; i++) {
-            float voltage = (adc_buffer2[i] * VREF) / 4095.0f;
-            sum += voltage;
-        }
-        return sum / BUFFER2_SIZE;
-    }
-    return -1.0f; // 错误返回值
+	if (result == 0) {
+		float sum = 0.0f;
+		for (int i = 0; i < BUFFER2_SIZE; i++) {
+			float voltage = (adc_buffer2[i] * VREF) / 4095.0f;
+			sum += voltage;
+		}
+		return sum / BUFFER2_SIZE;
+	}
+	return -1.0f; // 错误返回值
 }
 
 //采样可视化+
@@ -1428,15 +1527,15 @@ int main(void) {
 	/* Infinite loop */
 	/* USER CODE BEGIN WHILE */
 
-while (1) {
+	while (1) {
 //	  GPIO_PinState pinState = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_14);
 //	  if(pinState==GPIO_PIN_SET){
 //		  GPIO_PinState pinState = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_1);
-	//	  if(pinState==GPIO_PIN_SET){
-	//		  black_box_test();
-	//		  }else{
+		//	  if(pinState==GPIO_PIN_SET){
+		//		  black_box_test();
+		//		  }else{
 		component_test();
-	//		  }
+		//		  }
 
 //	  else{
 //		  //HAL_DeInit(3000);
