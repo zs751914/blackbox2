@@ -1,3 +1,13 @@
+/*
+ * font.h
+ *
+ *  Created on: Feb 16, 2025
+ *      Author: Lenovo
+ */
+
+#ifndef INC_FONT_H_
+#define INC_FONT_H_
+
 #ifndef __FONT_H
 #define __FONT_H
 #include "stdint.h"
@@ -27,20 +37,34 @@ typedef struct Font {
 } Font;
 
 extern const Font font16x16;
-
-extern const Font font20x22;
+extern const Font font12x12;
+extern const Font font13x13;
 /**
  * @brief 图片结构体
  * @note  图片数据可以使用波特律动LED取模助手生成(https://led.baud-dance.com)
  */
-typedef struct Image {
-  uint8_t w;           // 图片宽度
-  uint8_t h;           // 图片高度
-  const uint8_t *data; // 图片数据
+
+
+// 声明 Image 结构体（如果 oled.h 未定义）
+typedef struct {
+    uint16_t w;     // 图片宽度
+    uint16_t h;     // 图片高度
+    const uint8_t *data; // 图片数据指针
 } Image;
 
-extern const Image bilibiliImg;
+// 声明四张图片变量
 
-extern const Image evaImg;
+extern const Image RCBINGLIANImg;;
+extern const Image RLBINGLIANImg;
+extern const Image RCCHUANLIANImg;
+extern const Image RLCHUANLIANImg;
+extern const Image CImg;
+extern const Image LImg;
+extern const Image LEDImg;
+extern const Image RImg;
+extern const Image LEDYOUImg;
 
 #endif // __FONT_H
+
+
+#endif /* INC_FONT_H_ */

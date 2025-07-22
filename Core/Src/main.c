@@ -28,9 +28,11 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "oled.h"
+#include "font.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include "key.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -54,6 +56,8 @@
 #define STEP3_PIN    GPIO_PIN_4      //PA4:RC输入信号
 #define STEP4_PIN    GPIO_PIN_15
 #define SAMPLE_STEP   20
+#define Threshold_voltage_S  0.6693f
+#define Threshold_voltage_P  2.5f
 typedef enum {
 	UNKNOWN,
 	no_load,
@@ -149,6 +153,11 @@ uint16_t bigadc_buffer[BIGBUFFER_SIZE];
 volatile uint32_t step_time_index = 0;  // 阶跃时间点索引
 volatile uint8_t measurement_done = 0;  // 测量完成标志
 volatile uint32_t step_timeout_index = 0;  // 阶跃时间点结束索引
+//输入捕获
+uint32_t capture_value = 0;
+uint32_t overflow_count = 0;
+float time_constant = 0.0f;
+uint8_t measurement_complete = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -183,6 +192,9 @@ int status;
 void GPIO_Set_Low(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin);
 void GPIO_Set_HighZ(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin);
 void GPIO_Set_High(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin);
+//输入捕获
+void StartMeasurement(void);
+float CalculateTimeConstant(void);
 
 /* USER CODE END PFP */
 
@@ -211,6 +223,94 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc) {
 	if (hadc->ErrorCode & HAL_ADC_ERROR_DMA) {
 	}
+}
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
+	if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
+		// 关键修改：先停止定时器再读取值
+		HAL_TIM_IC_Stop_IT(htim, TIM_CHANNEL_2);
+		HAL_TIM_Base_Stop_IT(htim);
+
+		// 清除中断标志！防止残留标志影响下次测量
+		__HAL_TIM_CLEAR_FLAG(htim, TIM_FLAG_CC2 | TIM_FLAG_UPDATE);
+
+		capture_value = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
+
+		// 确保定时器完全停止后再操作GPIO
+		HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_RESET);
+
+		measurement_complete = 1;
+	}
+}
+//定时器2溢出中断回调
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+	if (htim->Instance == TIM2) {
+		// 防止测量完成后的无效溢出计数
+		if (!measurement_complete) {
+			overflow_count++;
+		}
+		// 清除更新标志
+		__HAL_TIM_CLEAR_FLAG(htim, TIM_FLAG_UPDATE);
+	}}
+
+// 预测电感理论值的统一非线性函数
+float predict_L_theory(float L_actual, float ESR) {
+    // 关键参数（基于物理规律优化）
+    const float esr_mid = 8.0f;    // 特征中点ESR（8Ω）
+    const float esr_scale = 22.0f; // 30Ω - 8Ω = 22Ω
+    const float min_factor = 0.5f; // ESR→0时的最小系数
+    const float max_factor = 2.0f; // ESR→∞时的最大系数
+
+    // 计算动态缩放因子（基于tanh的平滑过渡）
+    float t = (ESR - esr_mid) / esr_scale;
+    float factor = min_factor + (max_factor - min_factor) * (0.5f + 0.5f * tanhf(3.0f * t));
+
+    // 应用非线性补偿（ESR越高补偿越强）
+    float compensation = 1.0f + 0.15f * powf(ESR / 30.0f, 2.0f);
+    return factor * L_actual * compensation;
+}
+
+
+/* 启动测量过程 */
+void StartMeasurement(void) {
+	// 确保完全停止定时器
+	HAL_TIM_IC_Stop_IT(&htim2, TIM_CHANNEL_2);
+	HAL_TIM_Base_Stop_IT(&htim2);
+
+	// 清除所有可能残留的标志
+	__HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_CC2 | TIM_FLAG_UPDATE);
+
+	overflow_count = 0;
+	measurement_complete = 0;
+	__HAL_TIM_SET_COUNTER(&htim2, 0);  // 必须重置计数器
+
+	// GPIO操作（增加延时确保电平稳定）
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_RESET);
+	HAL_Delay(1);  // 延长稳定时间
+
+	// 启动定时器（注意顺序）
+	HAL_TIM_Base_Start_IT(&htim2);          // 先启动基础计数
+	HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_2); // 再启动捕获
+
+	// 最后触发信号
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_SET);
+	//HAL_Delay(1);  // 延长稳定时间
+
+}
+
+/* 计算时间常数 */
+float CalculateTimeConstant(void) {
+	uint32_t timer_clock = HAL_RCC_GetPCLK1Freq() * 2;
+	uint32_t prescaler = htim2.Init.Prescaler + 1;
+
+	// 关键修正：使用32位实际最大值
+	uint32_t timer_max = 0xFFFFFFFF; // 32位定时器最大值
+
+	// 防止溢出计数为0时的异常
+	uint64_t total_ticks = (uint64_t) overflow_count * timer_max
+			+ capture_value;
+
+	float total_time = (float) total_ticks / (timer_clock / prescaler);
+	return total_time;
 }
 
 //黑箱测量
@@ -248,11 +348,7 @@ void component_test() {
 	VPA1F = VPA1;
 	VPA0F = VPA0;
 	VPA7F = VPA7;
-	if (adc_buffer1_com[20] >= 0.98 * VREF && adc_buffer2_com[20] <= 0.01f) {
-		sprintf(msg, "no load");
-	} else {
-		Determine_component();
-	}
+	Determine_component();
 }
 
 void GPIO_Set_HighZ(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin) {
@@ -329,9 +425,14 @@ void Determine_component() {
 					}
 				}
 				float r_com = (v_initial * R_KNOWN) / (VREF - v_initial);
-				float c_com = tau / r_com;
-				sprintf(message1, "Rs=%.2fΩ", r_com);
-				sprintf(message2, "Cs=%.4fuF", c_com);
+				float c_com = tau / (r_com+51);
+//				sprintf(message1, "Rs=%.2fΩ", r_com);
+//				sprintf(message2, "Cs=%.4fuF", c_com);
+				sprintf(message1, "ESR=%.2f C=%.4fuF", r_com,(c_com * 1e6)-0.2f);
+				OLED_NewFrame();
+				OLED_DrawImage(0, 0, &CImg, OLED_COLOR_NORMAL);
+				OLED_PrintASCIIString(0, 48, message1, &afont8x6,OLED_COLOR_NORMAL);
+				OLED_ShowFrame();
 			} else {
 				float v_initial = 0.0f;
 				//int initial_index;
@@ -366,8 +467,13 @@ void Determine_component() {
 					}
 					//float r_com = (v_initial * 5100) / (VREF - v_initial);
 					float c_com = tau / (r_com + 5100);
-					sprintf(message1, "Rs=%.2fΩ", r_com);
-					sprintf(message2, "Cs=%.4fuF", c_com * 1e6);
+//					sprintf(message1, "Rs=%.2fΩ", r_com);
+//					sprintf(message2, "Cs=%.4fuF", c_com * 1e6);
+					sprintf(message1, "ESR=%.2f C=%.4fuF", r_com,c_com * 1e6);
+					OLED_NewFrame();
+					OLED_DrawImage(0, 0, &CImg, OLED_COLOR_NORMAL);
+					OLED_PrintASCIIString(0, 48, message1, &afont8x6,OLED_COLOR_NORMAL);
+					OLED_ShowFrame();
 				} else {   //换电阻后未达稳态
 					float v_target1 = (adc_buffer1_com[800] * VREF) / 4095.0f;
 					float v_initial = 0.0f;
@@ -391,8 +497,13 @@ void Determine_component() {
 							/ log((VPA1Z - v_target1) / (VPA1Z - v_target2));
 					//float   r_com=(v_initial* 5100) / (VREF - v_initial);
 					float c_com = tau / (r_com + 5100);
-					sprintf(message1, "Rs=%.2fΩ", r_com);
-					sprintf(message2, "Cs=%.4fuF", c_com * 1e6);
+//					sprintf(message1, "Rs=%.2fΩ", r_com);
+//					sprintf(message2, "Cs=%.4fuF", c_com * 1e6);
+					sprintf(message1, "ESR=%.2f C=%.4fuF", r_com,c_com * 1e6);
+					OLED_NewFrame();
+					OLED_DrawImage(0, 0, &CImg, OLED_COLOR_NORMAL);
+					OLED_PrintASCIIString(0, 48, message1, &afont8x6,OLED_COLOR_NORMAL);
+					OLED_ShowFrame();
 				}
 			}
 
@@ -427,8 +538,13 @@ void Determine_component() {
 				float tau = (index - initial_index) * 2 / 1000000;
 				float r_com = (v_initial * R_KNOWN) / (VREF - v_initial);
 				float c_com = tau / (r_com + R_KNOWN);
-				sprintf(message1, "Rs=%.2fΩ", r_com);
-				sprintf(message2, "Cs=%.4fuF", c_com * 1e6);
+//				sprintf(message1, "Rs=%.2fΩ", r_com);
+//				sprintf(message2, "Cs=%.4fuF", c_com * 1e6);
+				sprintf(message1, "ESR=%.2f C=%.4fuF", r_com,c_com * 1e6);
+				OLED_NewFrame();
+				OLED_DrawImage(0, 0, &CImg, OLED_COLOR_NORMAL);
+				OLED_PrintASCIIString(0, 48, message1, &afont8x6,OLED_COLOR_NORMAL);
+				OLED_ShowFrame();
 			} else {
 				HAL_Delay(50);  // 10ms放电
 				// 2. 启动DMA采样
@@ -438,7 +554,7 @@ void Determine_component() {
 				GPIO_Set_HighZ(GPIOB, GPIO_PIN_15);
 				uint32_t start_tick = HAL_GetTick();
 				HAL_ADC_Start_DMA(&hadc1, (uint32_t*) bigadc_buffer,
-						BIGBUFFER_SIZE);
+				BIGBUFFER_SIZE);
 				measurement_done = 0;
 				HAL_GPIO_WritePin(GPIOA, STEP_PIN, GPIO_PIN_SET);
 				// 3. 短暂延时确保DMA已启动
@@ -479,8 +595,13 @@ void Determine_component() {
 				float tau = (index - initial_index) * 2 / 1000000;
 				float r_com = (v_initial * R_KNOWN) / (VREF - v_initial);
 				float c_com = tau / (r_com + R_KNOWN);
-				sprintf(message1, "Rs=%.2fΩ", r_com);
-				sprintf(message2, "Cs=%.4fuF", c_com * 1e6);
+//				sprintf(message1, "Rs=%.2fΩ", r_com);
+//				sprintf(message2, "Cs=%.4fuF", c_com * 1e6);
+				sprintf(message1, "ESR=%.2f C=%.4fuF", r_com,c_com * 1e6);
+				OLED_NewFrame();
+				OLED_DrawImage(0, 0, &CImg, OLED_COLOR_NORMAL);
+				OLED_PrintASCIIString(0, 48, message1, &afont8x6,OLED_COLOR_NORMAL);
+				OLED_ShowFrame();
 			}
 
 		}
@@ -490,6 +611,28 @@ void Determine_component() {
 			&& Analyze_trend(adc_buffer2_com, VPA1F) == 1) {
 		component.type = COMPONENT_L;
 		//计算RL
+		HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_SET);
+		StartMeasurement();
+		while (!measurement_complete);
+		float total_time = CalculateTimeConstant();
+		//计算
+		float V_steady = VPA1F;       // 实际稳态电压
+		float V_supply = VPA7F;       // 实际电源电压
+		float Rs = (R_KNOWN * fabs(V_supply - V_steady) / fmaxf(V_steady, 1e-6f));
+		float R=1.5303*Rs+2.24;
+		component.params.inductor.esr = fabsf(Rs);
+		float a = fabs(VPA1F - Threshold_voltage_S) / VPA7F;
+		float tau = -total_time / log(a);
+		tau = total_time*2.0f;
+		component.params.inductor.inductance= tau * (R + R_KNOWN);
+		float l_com=predict_L_theory(component.params.inductor.inductance, R-1);
+		measurement_complete = 0;
+		HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_RESET);
+		sprintf(message1, "ESR=%.2f L=%.4fmH", R-2,l_com * 1e3);
+		OLED_NewFrame();
+		OLED_DrawImage(0, 0, &LImg, OLED_COLOR_NORMAL);
+		OLED_PrintASCIIString(0, 48, message1, &afont8x6,OLED_COLOR_NORMAL);
+		OLED_ShowFrame();
 	} else {
 		float a = Danalyze();
 		if (a) {   //求平均有极值，差值小于2v
@@ -497,12 +640,19 @@ void Determine_component() {
 			component.params.diode.forward_voltage = fabs(a);
 			if (a > 0) {
 				component.params.diode.polarity == L_TO_R;   //>>
-				sprintf(message1, " Z V=%.2fΩ",
-						component.params.diode.forward_voltage);
+				sprintf(message1, "  V=%.2fv",component.params.diode.forward_voltage);
+				OLED_NewFrame();
+				OLED_DrawImage(0, 0, &LEDImg, OLED_COLOR_NORMAL);
+				OLED_PrintASCIIString(0, 48, message1, &afont8x6,OLED_COLOR_NORMAL);
+				OLED_ShowFrame();
+
 			} else {
 				component.params.diode.polarity == R_TO_L;   //<<
-				sprintf(message1, " F V=%.2fΩ",
-						component.params.diode.forward_voltage);
+				sprintf(message1, "  V=%.2fv",component.params.diode.forward_voltage);
+				OLED_NewFrame();
+				OLED_DrawImage(0, 0, &LEDYOUImg, OLED_COLOR_NORMAL);
+				OLED_PrintASCIIString(0, 48, message1, &afont8x6,OLED_COLOR_NORMAL);
+				OLED_ShowFrame();
 			}
 			//计算D
 		} else {
@@ -523,13 +673,14 @@ void Determine_component() {
 			VPA1F = VPA1;
 			//VPA0F=VPA0;
 			//VPA7F=VPA7;
+
 			float v_initial;
 			//float index;
 			//int find = 0;
 
-							//float c_com = tau / r_com;
+			//float c_com = tau / r_com;
 			int initial_index;
-			int index=0;
+			int index = 0;
 			if (Analyze_trend(adc_buffer3_com, VPA1Z) == 1
 					&& Analyze_trend(adc_buffer4_com, VPA1F) == -1) {
 				component.type = COMPONENT_C;   //计算小c
@@ -540,33 +691,54 @@ void Determine_component() {
 					float voltage = (adc_buffer3_com[i] * VREF) / 4095.0f;
 					if (voltage > MIN_VOLTAGE) {
 						v_initial = voltage;
-						initial_index=i;
+						initial_index = i;
 						break;
 					}
 				}
 				float r_com = (v_initial * R_KNOWN) / (VREF - v_initial);
 				//float c_com = tau / r_com;
-				sprintf(message1, "Rs=%.2fΩ", r_com);
+				//sprintf(message1, "Rs=%.2fΩ", r_com);
 				float v_target = 0.632 * VPA1Z;
 				for (int i = 0; i < BUFFER_SIZE; i++) {
 					float voltage = (adc_buffer3_com[i] * VREF) / 4095.0f;
 					if (voltage >= v_target) {
-						 index = i;
+						index = i;
 						break;
 					}
 				}
 				float tau = (index - initial_index) * 2 / 1000000;
 				//float tau = Find_tau_com(adc_buffer3_com);
 				float c_com = tau / r_com;
-				sprintf(message2, "Cs=%.2fΩ", c_com * 1e6);
+				//sprintf(message2, "Cs=%.2fΩ", c_com * 1e6);
+				sprintf(message1, "ESR=%.2f C=%.4fuF", r_com,c_com * 1e6);
+				OLED_NewFrame();
+				OLED_DrawImage(0, 0, &CImg, OLED_COLOR_NORMAL);
+				OLED_PrintASCIIString(0, 48, message1, &afont8x6,OLED_COLOR_NORMAL);
+				OLED_ShowFrame();
+				//
+
 			} else if (analyze_Vpicture(adc_buffer3_com, adc_buffer4_com)
 					== 1) {
 				//
 				component.type = COMPONENT_R;   //
 				float V = calculate_average(adc_buffer3_com);
 				float R;
-				R = 470000 / (VPA0Z - V) * V;
-				sprintf(message1, " R=%.2fΩ", R);
+				R = 510000 / (VPA0Z - V) * V;
+				if (fabs(R) > 12000000) {
+					sprintf(msg, "NULL");
+					OLED_NewFrame();
+					OLED_PrintString(0, 0, msg, &font16x16, OLED_COLOR_NORMAL);
+					OLED_ShowFrame();
+					return;
+				}else{
+					sprintf(message1, " R=%.2fΩ", R);
+					OLED_NewFrame();
+					OLED_DrawImage(0, 0, &RImg, OLED_COLOR_NORMAL);
+					OLED_PrintString(0, 48, message1, &font12x12,
+							OLED_COLOR_NORMAL);
+					OLED_ShowFrame();
+				}
+
 				//return 1;
 				//计算大电阻
 			} else if (analyze_Vpicture(adc_buffer1_com, adc_buffer2_com)
@@ -582,9 +754,45 @@ void Determine_component() {
 				float V = calculate_average(adc_buffer3_com);
 				float R;
 				R = 5100 / (VPA0Z - V) * V;
-				sprintf(message1, " R=%.2fΩ", R);
+				if (fabs(R) > 12000000) {
+					sprintf(msg, "NULL");
+					OLED_NewFrame();
+					OLED_PrintString(0, 0, msg, &font16x16, OLED_COLOR_NORMAL);
+					OLED_ShowFrame();
+					return;
+				} else {
+					sprintf(message1, " R=%.2fΩ", R);
+					OLED_NewFrame();
+					OLED_DrawImage(0, 0, &RImg, OLED_COLOR_NORMAL);
+					OLED_PrintString(0, 48, message1, &font12x12,
+							OLED_COLOR_NORMAL);
+					OLED_ShowFrame();
+				}
+
 			} else {
-				//小电阻电感
+				//小电阻
+				float V = calculate_average(adc_buffer1_com);
+				float R;
+				R = 51 / (VPA0Z - V) * V;
+				if (R > 120000000) {
+					sprintf(msg, "NULL");
+					OLED_NewFrame();
+					OLED_PrintString(0, 0, msg, &font16x16, OLED_COLOR_NORMAL);
+					OLED_ShowFrame();
+				} else {
+					if (R > 20) {
+						sprintf(message1, " R=%.2fΩ", R - 20);
+					} else {
+						sprintf(message1, " R=%.2fΩ", R);
+					}
+
+					OLED_NewFrame();
+					OLED_DrawImage(0, 0, &RImg, OLED_COLOR_NORMAL);
+					OLED_PrintString(0, 48, message1, &font12x12,
+							OLED_COLOR_NORMAL);
+					OLED_ShowFrame();
+				}
+
 			}
 
 		}
@@ -635,7 +843,9 @@ float Find_tau_com(uint16_t *adc_buffer) {
 	// 4. 计算时间常数（改进计算方法）
 	if (index1 > 0 && index2 > 0 && index2 - index1 > 50) {
 		// 使用两个时间点计算时间常数，提高准确性
-		float delta_index = index2 - index1;
+		float delta_index1 = index2 - index1;
+		float delta_index2=index1-start_index;
+		float delta_index=(delta_index1+delta_index2)/2;
 		float tau = delta_index * (1.0f / SAMPLE_RATE);
 		return tau;
 	} else {
@@ -759,18 +969,6 @@ int Analyze_trend(uint16_t *adc_buffer, float V_steady) {
 float Danalyze() {
 	//float IZ=fabs(VPA0Z-VPA1Z)
 	// 判断电压范围的辅助函数
-	int is_near_3v3(float voltage) {
-		return voltage >= 3.0f && voltage <= 3.3f;
-	}
-	int is_near_0v(float voltage) {
-		return voltage >= 0.0f && voltage <= 0.3f;
-	}
-	int is_near_0v7(float voltage) {
-		return voltage >= 0.6f && voltage <= 0.8f;
-	}
-	int is_near_2v6(float voltage) {
-		return voltage >= 2.5f && voltage <= 2.8f;
-	}
 
 	float v1 = calculate_average(adc_buffer1_com);
 	float IZ = fabs(VPA0Z - v1) / 51;
@@ -778,19 +976,54 @@ float Danalyze() {
 	float IF = fabs(v2 - VPA0F) / 51;
 	float a = IZ / IF;
 	float b = IF / IZ;
-	float delta = fabs(v1 - v2);
-	if (a > 5 || b >= 5) {
-		if (a > 5) {
+	if (fabs(v1-3.3)<0.01&&fabs(v2)<0.01) {
+		sprintf(msg, "NULL");
+		OLED_NewFrame();
+		OLED_PrintString(0, 0, msg, &font16x16, OLED_COLOR_NORMAL);
+		OLED_ShowFrame();
+		return 0;
+	}
+	//float delta = fabs(v1 - v2);
+	else if (a > 20 || b > 20) {
+		GPIO_Set_HighZ(GPIOA, GPIO_PIN_0);
+			GPIO_Set_HighZ(GPIOA, GPIO_PIN_4);
+			GPIO_Set_Low(GPIOA, GPIO_PIN_7);
+			GPIO_Set_Low(GPIOB, GPIO_PIN_15);
+			memset(adc_buffer3_com, 0, sizeof(adc_buffer3_com));
+			DMA_Measure_com(4, adc_buffer3_com);
+			VPA1Z = VPA1;
+			VPA0Z=VPA0;
+			VPA7Z=VPA7;
+			//VPA0Z=VPA0;
+			//VPA7Z=VPA7;
+			GPIO_Set_HighZ(GPIOA, GPIO_PIN_0);
+			GPIO_Set_HighZ(GPIOA, GPIO_PIN_4);
+			memset(adc_buffer4_com, 0, sizeof(adc_buffer4_com));
+			DMA_Measure_com(2, adc_buffer4_com);
+			VPA1F = VPA1;
+		    VPA0F=VPA0;
+		    VPA7F=VPA7;
+			float v1 = calculate_average(adc_buffer3_com);
+			float IZ = fabs(VPA0Z - v1) / 51;
+			float v2 = calculate_average(adc_buffer4_com);
+			float IF = fabs(v2 - VPA0F) / 51;
+			float a = IZ / IF;
+			float b = IF / IZ;
+			float delta1=VPA1Z-VPA7Z;
+		float delta2 = VPA7F - VPA1F;
+
+		if (fabs(v1-3.3)<0.1f) {
 			//sprintf(message1, " Z V=%.2fΩ", delta);
-			return delta;
+			return -delta2;
 		} else {
 			//sprintf(message1, " F V=%.2fΩ", delta);
-			return -delta;
+			return delta1;
 		}
 	} else {
 		return 0;
 	}
 }
+//
 //
 float calculate_average(uint16_t *buffer) {
 	float sum = 0.0f;
@@ -818,6 +1051,7 @@ void DMA_Measure_com(int sign, uint16_t *adc_buffer) {
 	if (sign == 1) {
 		// STEP_PIN: 高电平
 		HAL_GPIO_WritePin(GPIOA, STEP_PIN, GPIO_PIN_SET);
+		//return 1;
 	} else if (sign == 2) {
 		// STEP3_PIN: 高电平
 		HAL_GPIO_WritePin(GPIOA, STEP2_PIN, GPIO_PIN_SET);
@@ -877,6 +1111,8 @@ void DMA_Measure(void) {
 	sprintf(msg, "Rate: %.1fkHz", actual_rate);
 	HAL_Delay(50);
 	VPA1 = Sample_PA1_Average();
+	VPA7 = Sample_PA7_Average();
+	VPA0 = Sample_PA0_Average();
 	GPIO_Set_Low(GPIOA, GPIO_PIN_0);
 	GPIO_Set_Low(GPIOA, GPIO_PIN_4);
 	GPIO_Set_Low(GPIOA, GPIO_PIN_7);
@@ -1006,12 +1242,18 @@ void Determine_black_box(void) {
 	if (chazhi < 0.1 && !evaluate_voltage_slope()) {
 		black_box.detected_type = OR;
 		if (BigRtest() == 1) {
-			strcpy(message2, "Pure Resistor");
+			strcpy(message1, "Pure Resistor");
+			OLED_NewFrame();
+			OLED_PrintString(0, 0, message1, &font16x16,OLED_COLOR_NORMAL);
+			OLED_ShowFrame();
 		} else if (BigRtest() == 0) {
 			black_box.detected_type = RC;
 			Analyze_ADC_RC_TEST();
 		} else {
-			sprintf(msg, "no load");
+			sprintf(msg, "NULL");
+			OLED_NewFrame();
+			OLED_PrintString(0, 0, msg, &font16x16,OLED_COLOR_NORMAL);
+			OLED_ShowFrame();
 		}
 
 	} else if (v_steady > v_initial) {
@@ -1067,6 +1309,14 @@ int BigRtest(void) {
 	float chazhi = fabsf(v_end - v_initial);
 	if (chazhi < 0.1) {
 		//black_box.detected_type=RESISTOR;
+		float v1=calculate_average(adc_buffer);
+		float R=5100/(VREF-v1)*v1;
+		strcpy(message1, "Pure Resistor");
+		sprintf(message2, " R=%.2fΩ", R);
+		OLED_NewFrame();
+		OLED_PrintString(0, 0, message1, &font12x12,OLED_COLOR_NORMAL);
+		OLED_PrintString(0, 16, message2, &font12x12,OLED_COLOR_NORMAL);
+		OLED_ShowFrame();
 		return 1;
 	} else {
 		//black_box.detected_type=RC;
@@ -1128,13 +1378,20 @@ void Analyze_ADC_RC_TEST() {
 			if (black_box.detected_type == RC_SERIES) {
 				r_black = (v_initial_RCS * R_KNOWN2) / (VREF - v_initial_RCS);
 				c_black = tau / (r_black + R_KNOWN2);
-				sprintf(message1, "Rs=%.2fΩ", r_black);
-				sprintf(message2, "Cs=%.4fuF", c_black * 1e6);
+				sprintf(message1, "R=%.2f C=%.4fuF", r_black,c_black * 1e6);
+				OLED_NewFrame();
+				OLED_DrawImage(0, 0, &RCCHUANLIANImg, OLED_COLOR_NORMAL);
+				OLED_PrintASCIIString(0, 48, message1, &afont8x6,OLED_COLOR_NORMAL);
+				OLED_ShowFrame();
+
 			} else {
 				r_black = fabsf(R_KNOWN2 * v_end / (VREF - v_end));
 				c_black = tau * (R_KNOWN2 + r_black) / (r_black * R_KNOWN2);
-				sprintf(message1, "Rp=%.2fΩ", r_black);
-				sprintf(message2, "Cp=%.4fuF", c_black * 1e6);
+				sprintf(message1, "R=%.2f C=%.4fuF", r_black,c_black * 1e6);
+				OLED_NewFrame();
+				OLED_DrawImage(0, 0, &RCBINGLIANImg, OLED_COLOR_NORMAL);
+				OLED_PrintASCIIString(0, 48, message1, &afont8x6,OLED_COLOR_NORMAL);
+				OLED_ShowFrame();
 			}
 		} else {
 			sprintf(message1, "too small");
@@ -1153,14 +1410,19 @@ void Analyze_ADC_RC_TEST() {
 		if (black_box.detected_type == RC_SERIES) {
 			r_black = (v_initial_RCS * R_KNOWN2) / (VREF - v_initial_RCS);
 			c_black = tau / (r_black + R_KNOWN2);
-
-			sprintf(message1, "Rs=%.2fΩ", r_black);
-			sprintf(message2, "Cs=%.4fuF", c_black * 1e6);
+			sprintf(message1, "R=%.2f C=%.4fuF", r_black,c_black * 1e6);
+			OLED_NewFrame();
+			OLED_DrawImage(0, 0, &RCCHUANLIANImg, OLED_COLOR_NORMAL);
+			OLED_PrintASCIIString(0, 48, message1, &afont8x6,OLED_COLOR_NORMAL);
+			OLED_ShowFrame();
 		} else {
 			r_black = fabsf(R_KNOWN2 * VPA1 / (VREF - VPA1));
 			c_black = tau * (R_KNOWN2 + r_black) / (r_black * R_KNOWN2);
-			sprintf(message1, "Rp=%.2fΩ", r_black);
-			sprintf(message2, "Cp=%.4fuF", c_black * 1e6);
+			sprintf(message1, "R=%.2f C=%.4fuF", r_black,c_black * 1e6);
+			OLED_NewFrame();
+			OLED_DrawImage(0, 0, &RCBINGLIANImg, OLED_COLOR_NORMAL);
+			OLED_PrintASCIIString(0, 48, message1, &afont8x6,OLED_COLOR_NORMAL);
+			OLED_ShowFrame();
 		}
 	}
 }
@@ -1203,35 +1465,79 @@ void Analyze_ADC_RL_TEST() {
 			//break;
 		}
 	}
-	if (v_initial_RLP + v_steady >= VREF) {
+	if (v_initial_RLP + v_steady >= VPA7) {
 		black_box.detected_type = RL_PARALLEL;
 	} else {
 		black_box.detected_type = RL_SERIES;
 	}
-	float tau = Calculate_tau();
-	if (tau) {
-		//计算tau，计算RL
+	//float tau = Calculate_tau();
+//	if (0) {
+//		//计算tau，计算RL
+//		if (black_box.detected_type == RL_SERIES) {
+//
+//			float Rs = R_KNOWN * (VREF - v_steady) / fmaxf(v_steady, 1e-6f);
+//			black_box.measurement[0].resistance = fabsf(Rs);
+//			black_box.measurement[0].inductance = tau * (Rs + R_KNOWN);
+//			sprintf(message1, "Rs=%.2fΩ", black_box.measurement[0].resistance);
+//			sprintf(message2, "Ls=%.4fmH",
+//					black_box.measurement[0].inductance * 1e3);
+//		} else {
+//
+//			float Rp = R_KNOWN * fmaxf(VREF - v_initial_RLP, 0)
+//					/ fmaxf(v_initial_RLP, 1e-6f);
+//			black_box.measurement[0].resistance = fabsf(Rp);
+//			black_box.measurement[0].inductance = tau * (R_KNOWN * Rp)
+//					/ (Rp + R_KNOWN);
+//			sprintf(message1, "Rp=%.2fΩ", black_box.measurement[0].resistance);
+//			sprintf(message2, "Lp=%.4fmH",
+//					black_box.measurement[0].inductance * 1e3);
+//		}
+//	} else {
 		if (black_box.detected_type == RL_SERIES) {
-
-			float Rs = R_KNOWN * (VREF - v_steady) / fmaxf(v_steady, 1e-6f);
+			HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_SET);
+			StartMeasurement();
+			while (!measurement_complete);
+			float total_time = CalculateTimeConstant();
+			//计算
+			float V_steady = VPA1;       // 实际稳态电压
+			float V_supply = VPA7;       // 实际电源电压
+			float Rs = R_KNOWN * (V_supply - V_steady) / fmaxf(V_steady, 1e-6f);
 			black_box.measurement[0].resistance = fabsf(Rs);
+			float a = fabs(VPA1 - Threshold_voltage_S) / VPA7;
+			float tau = -total_time / log(a);
 			black_box.measurement[0].inductance = tau * (Rs + R_KNOWN);
-			sprintf(message1, "Rs=%.2fΩ", black_box.measurement[0].resistance);
-			sprintf(message2, "Ls=%.4fmH",
-					black_box.measurement[0].inductance * 1e3);
-		} else {
+			measurement_complete = 0;
+			HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_RESET);
+			sprintf(message1, "R=%.2f L=%.4fmH", Rs,black_box.measurement[0].inductance * 1e3);
+			OLED_NewFrame();
+			OLED_DrawImage(0, 0, &RLCHUANLIANImg, OLED_COLOR_NORMAL);
+			OLED_PrintASCIIString(0, 48, message1, &afont8x6,OLED_COLOR_NORMAL);
+			OLED_ShowFrame();
 
-			float Rp = R_KNOWN * fmaxf(VREF - v_initial_RLP, 0)
-					/ fmaxf(v_initial_RLP, 1e-6f);
-			black_box.measurement[0].resistance = fabsf(Rp);
-			black_box.measurement[0].inductance = tau * (R_KNOWN * Rp)
-					/ (Rp + R_KNOWN);
-			sprintf(message1, "Rp=%.2fΩ", black_box.measurement[0].resistance);
-			sprintf(message2, "Lp=%.4fmH",
-					black_box.measurement[0].inductance * 1e3);
-		}
-	} else {
-		sprintf(message1, "too small");
+		} else {
+//			StartMeasurement();
+//			while (!measurement_complete);
+//			float total_time = CalculateTimeConstant();
+			//计算
+			float V_steady = VPA1;       // 实际稳态电压
+			float V_supply = VPA7;       // 实际电源电压
+			// 并联电路总电阻 R_total = R || RL = (R*RL)/(R+RL)
+			float R_total = R_KNOWN * V_steady / (V_supply - V_steady);
+			// 解得并联电阻 RL = (R*R_total)/(R-R_total)
+			float RL = (R_KNOWN * R_total) / (R_KNOWN - R_total);
+			black_box.measurement[0].resistance = RL;
+			// 并联电路时间常数 τ = L/R，其中R是并联电阻RL
+			float a = fabs(VPA1 - Threshold_voltage_P) / VPA7; // 使用并联阈值
+			float tau = Calculate_tau();
+			//tau = -total_time / log(a);
+			black_box.measurement[0].inductance = tau * RL;
+			measurement_complete = 0;
+			sprintf(message1, "R=%.2f L=%.4fmH", RL,black_box.measurement[0].inductance * 1e3);
+			OLED_NewFrame();
+			OLED_DrawImage(0, 0, &RLBINGLIANImg, OLED_COLOR_NORMAL);
+			OLED_PrintASCIIString(0, 48, message1, &afont8x6,OLED_COLOR_NORMAL);
+			OLED_ShowFrame();
+
 	}
 
 }
@@ -1478,42 +1784,46 @@ float Find_tau() {
 /* USER CODE END 0 */
 
 /**
- * @brief  The application entry point.
- * @retval int
- */
-int main(void) {
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
 
-	/* USER CODE BEGIN 1 */
+  /* USER CODE BEGIN 1 */
 
-	/* USER CODE END 1 */
+  /* USER CODE END 1 */
 
-	/* MCU Configuration--------------------------------------------------------*/
+  /* MCU Configuration--------------------------------------------------------*/
 
-	/* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-	HAL_Init();
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
 
-	/* USER CODE BEGIN Init */
+  /* USER CODE BEGIN Init */
 
-	/* USER CODE END Init */
+  /* USER CODE END Init */
 
-	/* Configure the system clock */
-	SystemClock_Config();
+  /* Configure the system clock */
+  SystemClock_Config();
 
-	/* USER CODE BEGIN SysInit */
+  /* USER CODE BEGIN SysInit */
 
-	/* USER CODE END SysInit */
+  /* USER CODE END SysInit */
 
-	/* Initialize all configured peripherals */
-	MX_GPIO_Init();
-	MX_DMA_Init();
-	MX_ADC1_Init();
-	MX_TIM3_Init();
-	MX_USART1_UART_Init();
-	MX_I2C1_Init();
-	/* USER CODE BEGIN 2 */
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_ADC1_Init();
+  MX_TIM3_Init();
+  MX_USART1_UART_Init();
+  MX_I2C1_Init();
+  MX_TIM2_Init();
+  MX_TIM4_Init();
+  /* USER CODE BEGIN 2 */
 	HAL_Delay(30); // 单片机启动比OLED上电快,需要延迟等待一下
 	OLED_Init();
-
+	HAL_TIM_Base_Start_IT(&htim4);
+	KEY_Init();
 	//启用TIM3触发ADC
 	TIM_HandleTypeDef *adc_timer = &htim3;
 	// 设置采样率 (500kHz)
@@ -1522,80 +1832,152 @@ int main(void) {
 	//adc_timer->Instance->ARR = 2 - 1;   // 9 (CubeMX配置)
 	HAL_TIM_Base_Start(adc_timer);
 
-	/* USER CODE END 2 */
+	//开屏动画
+	OLED_NewFrame();
+	OLED_PrintString(0, 0, "电路黑箱测试仪", &font12x12, OLED_COLOR_NORMAL);
+	OLED_PrintString(0, 15, "李博宇 23231054", &font12x12, OLED_COLOR_NORMAL);
+	OLED_PrintString(0, 30, "薛诗上 23211305", &font12x12, OLED_COLOR_NORMAL);
+	OLED_PrintString(0, 45, "张烁今 23211311", &font12x12, OLED_COLOR_NORMAL);
+	OLED_ShowFrame();
+	HAL_Delay(2000);
 
-	/* Infinite loop */
-	/* USER CODE BEGIN WHILE */
+  /* USER CODE END 2 */
 
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+//按钮相关变量
+	Key_State state;
+//	uint32_t idle_time;这个是检验倒计时是否正常工作的变量，没用了目前
 	while (1) {
-//	  GPIO_PinState pinState = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_14);
-//	  if(pinState==GPIO_PIN_SET){
-//		  GPIO_PinState pinState = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_1);
-		//	  if(pinState==GPIO_PIN_SET){
-		//		  black_box_test();
-		//		  }else{
-		component_test();
-		//		  }
+		state = KEY_GetState();
 
-//	  else{
-//		  //HAL_DeInit(3000);
-//	  }
-		//black_box_test();
-		OLED_NewFrame();
-		OLED_PrintString(0, 0, message1, &font16x16, OLED_COLOR_NORMAL);
-		OLED_PrintString(0, 20, message2, &font16x16, OLED_COLOR_NORMAL);
-		OLED_PrintString(0, 40, msg, &font16x16, OLED_COLOR_NORMAL);
-		OLED_ShowFrame();
+					if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_1) == GPIO_PIN_SET) {
+					      if(state == KEY_STATE_SHORT_PRESS) {
+				         OLED_NewFrame();
+				         OLED_PrintString(0, 0, "BLACK_BOX TEST", &font12x12, OLED_COLOR_NORMAL);
+				         OLED_ShowFrame();
+				         HAL_Delay(1000);
+				         OLED_NewFrame();
+						 OLED_PrintString(0, 0, "under testing ...", &font12x12, OLED_COLOR_NORMAL);
+						 OLED_ShowFrame();
+						 black_box_test();
+						 HAL_Delay(1500);
+//
+					       }
+
+//				 		 /*********************
+//				 		   长按关机
+//				 		  *********************/
+//
+//					       else {
+//					     OLED_NewFrame();
+//					     OLED_PrintString(0, 0, "BLACK_BOX_TEST", &font12x12, OLED_COLOR_NORMAL);
+//					     OLED_ShowFrame();
+
+					     /*********************
+					     等待
+					     *********************/
+					       //}
+
+					}
+					//原件测量，基本思路同上
+					else {
+					      if(state == KEY_STATE_SHORT_PRESS) {
+					         OLED_NewFrame();
+					         OLED_PrintString(0, 0, "COMPONENT TEST", &font12x12, OLED_COLOR_NORMAL);
+					         OLED_ShowFrame();
+					         OLED_NewFrame();
+					         HAL_Delay(1000);
+							 OLED_PrintString(0, 0, "under testing ...", &font12x12, OLED_COLOR_NORMAL);
+							 OLED_ShowFrame();
+				             component_test();
+							 HAL_Delay(1500);
+						       }
+						      else if(state == KEY_STATE_LONG_PRESS) {
+						    	  OLED_NewFrame();
+							    	  OLED_PrintString(0, 0, "POWER OFF", &font12x12, OLED_COLOR_NORMAL);
+							    	  OLED_ShowFrame();
+							    	 HAL_Delay(10);
+						     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_RESET);
+						       }
+//						       else {
+//						     OLED_NewFrame();
+//						     OLED_PrintString(0, 0, "comment test", &font12x12, OLED_COLOR_NORMAL);
+//						     OLED_ShowFrame();
+//						     component_test();
+//						       }
+					}
+////				     /*********************
+////				     改完以后记得删注释
+////				     *********************/
+//		black_box_test();
+//		OLED_NewFrame();
+//		OLED_PrintString(0, 0, message1, &afont8x6, OLED_COLOR_NORMAL);
+//		OLED_PrintString(0, 10, message2, &afont8x6, OLED_COLOR_NORMAL);
+//		OLED_PrintString(0, 40, msg, &font16x16, OLED_COLOR_NORMAL);
+//		OLED_ShowFrame();
+//30s无操作关机函数
 		HAL_Delay(1500);  // 每2秒测量一次
-		/* USER CODE END WHILE */
+		if(KEY_GetIdleState() == IDLE_STATE_30S_INACTIVE) {
+	                // 30秒无操作处理
+	           OLED_NewFrame();
+	           OLED_PrintString(0, 0, "POWER OFF", &font12x12, OLED_COLOR_NORMAL);
+	           OLED_ShowFrame();
+	          HAL_Delay(1000);
+	          HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_RESET);
+		}
 
-		/* USER CODE BEGIN 3 */
+
+
 	}
 
-	/* USER CODE END 3 */
+  /* USER CODE END 3 */
 }
 
 /**
- * @brief System Clock Configuration
- * @retval None
- */
-void SystemClock_Config(void) {
-	RCC_OscInitTypeDef RCC_OscInitStruct = { 0 };
-	RCC_ClkInitTypeDef RCC_ClkInitStruct = { 0 };
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-	/** Configure the main internal regulator output voltage
-	 */
-	__HAL_RCC_PWR_CLK_ENABLE();
-	__HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
-	/** Initializes the RCC Oscillators according to the specified parameters
-	 * in the RCC_OscInitTypeDef structure.
-	 */
-	RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-	RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-	RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-	RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-	RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-	RCC_OscInitStruct.PLL.PLLM = 8;
-	RCC_OscInitStruct.PLL.PLLN = 100;
-	RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-	RCC_OscInitStruct.PLL.PLLQ = 4;
-	if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
-		Error_Handler();
-	}
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 100;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
-	/** Initializes the CPU, AHB and APB buses clocks
-	 */
-	RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
-			| RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
-	RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-	RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-	RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-	RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-	if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK) {
-		Error_Handler();
-	}
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
 /* USER CODE BEGIN 4 */
@@ -1603,19 +1985,19 @@ void SystemClock_Config(void) {
 /* USER CODE END 4 */
 
 /**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
-void Error_Handler(void) {
-	/* USER CODE BEGIN Error_Handler_Debug */
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
 	/* User can add his own implementation to report the HAL error return state */
 	__disable_irq();
 	while (1) {
 	}
-	/* USER CODE END Error_Handler_Debug */
+  /* USER CODE END Error_Handler_Debug */
 }
-
-#ifdef  USE_FULL_ASSERT
+#ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
   *         where the assert_param error has occurred.
